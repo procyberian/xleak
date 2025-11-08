@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use calamine::{Data, Range, Reader, Sheets, open_workbook_auto};
-use chrono::{NaiveDate, Duration};
+use chrono::{Duration, NaiveDate};
 use std::path::Path;
 
 pub struct Workbook {
@@ -20,23 +20,140 @@ impl Workbook {
         self.sheets.sheet_names()
     }
 
-    /// Load a specific sheet by name
+    /// Load a specific sheet by name (eager - loads all rows)
     pub fn load_sheet(&mut self, name: &str) -> Result<SheetData> {
         let range = self
             .sheets
             .worksheet_range(name)
             .with_context(|| format!("Sheet '{name}' not found"))?;
 
-        Ok(SheetData::from_range(range))
+        // Try to load formulas, but don't fail if they're not available
+        let formula_range = self.sheets.worksheet_formula(name).ok();
+
+        Ok(SheetData::from_range_with_formulas(range, formula_range))
+    }
+
+    /// Load a specific sheet with lazy loading (only loads headers, rows on demand)
+    pub fn load_sheet_lazy(&mut self, name: &str) -> Result<LazySheetData> {
+        let range = self
+            .sheets
+            .worksheet_range(name)
+            .with_context(|| format!("Sheet '{name}' not found"))?;
+
+        // Try to load formulas, but don't fail if they're not available
+        let formula_range = self.sheets.worksheet_formula(name).ok();
+
+        Ok(LazySheetData::from_range_with_formulas(range, formula_range))
     }
 }
 
+/// Eagerly-loaded sheet data (loads all rows immediately)
 #[derive(Debug, Clone)]
 pub struct SheetData {
     pub headers: Vec<String>,
     pub rows: Vec<Vec<CellValue>>,
+    pub formulas: Vec<Vec<Option<String>>>, // Parallel structure to rows with formulas
     pub width: usize,
     pub height: usize,
+}
+
+/// Lazy-loaded sheet data (loads rows on demand)
+pub struct LazySheetData {
+    range: Range<Data>,
+    formula_range: Option<Range<String>>,
+    pub headers: Vec<String>,
+    pub width: usize,
+    pub height: usize,
+}
+
+impl LazySheetData {
+    /// Create a new lazy sheet from ranges (doesn't load all rows)
+    pub fn from_range_with_formulas(
+        range: Range<Data>,
+        formula_range: Option<Range<String>>,
+    ) -> Self {
+        let (height, width) = range.get_size();
+
+        // Only extract headers (first row) - don't load all data yet
+        let headers = if height > 0 {
+            range
+                .rows()
+                .next()
+                .map(|row| row.iter().map(SheetData::cell_to_string).collect())
+                .unwrap_or_default()
+        } else {
+            vec![]
+        };
+
+        Self {
+            range,
+            formula_range,
+            headers,
+            width,
+            height: height.saturating_sub(1), // Don't count header row
+        }
+    }
+
+    /// Load a specific range of rows on demand (zero-indexed, header not included)
+    pub fn get_rows(&self, start: usize, count: usize) -> (Vec<Vec<CellValue>>, Vec<Vec<Option<String>>>) {
+        let end = (start + count).min(self.height);
+
+        // Extract requested rows (skip header + start rows, take count)
+        let rows: Vec<Vec<CellValue>> = self.range
+            .rows()
+            .skip(1 + start)  // Skip header + start offset
+            .take(end - start)
+            .map(|row| row.iter().map(SheetData::datatype_to_cellvalue).collect())
+            .collect();
+
+        // Extract formulas for requested rows
+        let formulas = self.get_formulas_for_range(start, end);
+
+        (rows, formulas)
+    }
+
+    /// Get formulas for a specific range of rows
+    fn get_formulas_for_range(&self, start: usize, end: usize) -> Vec<Vec<Option<String>>> {
+        if let Some(ref formula_range) = self.formula_range {
+            let formula_start = formula_range.start().unwrap_or((0, 0));
+            let total_height = self.height + 1; // Include header in total
+
+            // Create formula grid only for requested rows
+            let mut formula_grid: Vec<Vec<Option<String>>> =
+                vec![vec![None; self.width]; end - start];
+
+            // Populate formulas at their absolute positions
+            for (row_offset, formula_row) in formula_range.rows().enumerate() {
+                let absolute_row = formula_start.0 as usize + row_offset;
+
+                if absolute_row > 0 && absolute_row <= total_height {
+                    let data_row_idx = absolute_row - 1; // Convert to 0-based data row index
+
+                    // Only process if this row is in our requested range
+                    if data_row_idx >= start && data_row_idx < end {
+                        let result_idx = data_row_idx - start; // Index in result array
+
+                        for (col_offset, formula_str) in formula_row.iter().enumerate() {
+                            let absolute_col = formula_start.1 as usize + col_offset;
+                            if absolute_col < self.width && !formula_str.is_empty() {
+                                formula_grid[result_idx][absolute_col] = Some(formula_str.clone());
+                            }
+                        }
+                    }
+                }
+            }
+
+            formula_grid
+        } else {
+            // No formulas available
+            vec![vec![None; self.width]; end - start]
+        }
+    }
+
+    /// Convert to eager SheetData (loads everything)
+    pub fn to_sheet_data(self) -> SheetData {
+        SheetData::from_range_with_formulas(self.range, self.formula_range)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -50,7 +167,22 @@ pub enum CellValue {
     DateTime(f64), // Excel datetime as float
 }
 
+/// Cell value with optional formula
+#[derive(Debug, Clone)]
+pub struct CellValueWithFormula {
+    pub value: CellValue,
+    pub formula: Option<String>,
+}
+
 impl CellValue {
+    /// Attach a formula to this cell value
+    pub fn with_formula(self, formula: Option<String>) -> CellValueWithFormula {
+        CellValueWithFormula {
+            value: self,
+            formula,
+        }
+    }
+
     #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         matches!(self, CellValue::Empty)
@@ -59,6 +191,39 @@ impl CellValue {
     #[allow(dead_code)]
     pub fn is_numeric(&self) -> bool {
         matches!(self, CellValue::Int(_) | CellValue::Float(_))
+    }
+
+    /// Get raw value as string without formatting (for clipboard/export)
+    pub fn to_raw_string(&self) -> String {
+        match self {
+            CellValue::Empty => String::new(),
+            CellValue::String(s) => s.clone(),
+            CellValue::Int(i) => i.to_string(),
+            CellValue::Float(val) => {
+                if val.fract() == 0.0 {
+                    format!("{val:.0}")
+                } else {
+                    val.to_string()
+                }
+            }
+            CellValue::Bool(b) => b.to_string(),
+            CellValue::Error(e) => format!("#{e}"),
+            CellValue::DateTime(dt) => {
+                let epoch = NaiveDate::from_ymd_opt(1899, 12, 30).unwrap();
+                let date = epoch + Duration::days(dt.floor() as i64);
+                let time_fraction = dt.fract();
+                let total_seconds = (time_fraction * 86400.0).round() as i64;
+                let hours = total_seconds / 3600;
+                let minutes = (total_seconds % 3600) / 60;
+                let seconds = total_seconds % 60;
+
+                if time_fraction.abs() < 0.0000001 {
+                    format!("{}", date.format("%Y-%m-%d"))
+                } else {
+                    format!("{} {:02}:{:02}:{:02}", date.format("%Y-%m-%d"), hours, minutes, seconds)
+                }
+            }
+        }
     }
 }
 
@@ -153,6 +318,13 @@ impl std::fmt::Display for CellValue {
 
 impl SheetData {
     pub fn from_range(range: Range<Data>) -> Self {
+        Self::from_range_with_formulas(range, None)
+    }
+
+    pub fn from_range_with_formulas(
+        range: Range<Data>,
+        formula_range: Option<Range<String>>,
+    ) -> Self {
         let (height, width) = range.get_size();
 
         // Extract headers from first row if it exists
@@ -173,9 +345,41 @@ impl SheetData {
             .map(|row| row.iter().map(Self::datatype_to_cellvalue).collect())
             .collect();
 
+        // Extract formulas if available
+        // Note: Formula range may be sparse (only cells with formulas) and may have different start position
+        let formulas: Vec<Vec<Option<String>>> = if let Some(formula_range) = formula_range {
+            let formula_start = formula_range.start().unwrap_or((0, 0));
+
+            // Create empty formula structure matching data dimensions
+            let mut formula_grid: Vec<Vec<Option<String>>> =
+                vec![vec![None; width]; height];
+
+            // Populate formulas at their absolute positions
+            for (row_offset, formula_row) in formula_range.rows().enumerate() {
+                let absolute_row = formula_start.0 as usize + row_offset;
+                if absolute_row > 0 && absolute_row <= height {  // Skip header row (row 0)
+                    let data_row_idx = absolute_row - 1;  // Convert to 0-based data row index
+                    for (col_offset, formula_str) in formula_row.iter().enumerate() {
+                        let absolute_col = formula_start.1 as usize + col_offset;
+                        if absolute_col < width && !formula_str.is_empty() {
+                            formula_grid[data_row_idx][absolute_col] = Some(formula_str.clone());
+                        }
+                    }
+                }
+            }
+
+            // Return formula grid matching data rows
+            // We already handled header row when populating, so just take the data rows
+            formula_grid.into_iter().take(height.saturating_sub(1)).collect()
+        } else {
+            // No formulas available, create empty parallel structure
+            vec![vec![None; width]; height.saturating_sub(1)]
+        };
+
         Self {
             headers,
             rows,
+            formulas,
             width,
             height: height.saturating_sub(1), // Don't count header row
         }
@@ -213,5 +417,137 @@ impl SheetData {
             Data::DateTimeIso(s) => CellValue::String(s.clone()),
             Data::DurationIso(s) => CellValue::String(s.clone()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_cellvalue_display_integer() {
+        let val = CellValue::Int(1234567);
+        assert_eq!(val.to_string(), "1,234,567");
+    }
+
+    #[test]
+    fn test_cellvalue_display_negative_integer() {
+        let val = CellValue::Int(-1234567);
+        assert_eq!(val.to_string(), "-1,234,567");
+    }
+
+    #[test]
+    fn test_cellvalue_display_float() {
+        let val = CellValue::Float(1234567.89);
+        assert_eq!(val.to_string(), "1,234,567.89");
+    }
+
+    #[test]
+    fn test_cellvalue_display_float_whole_number() {
+        let val = CellValue::Float(1000.0);
+        assert_eq!(val.to_string(), "1,000");
+    }
+
+    #[test]
+    fn test_cellvalue_display_boolean() {
+        assert_eq!(CellValue::Bool(true).to_string(), "true");
+        assert_eq!(CellValue::Bool(false).to_string(), "false");
+    }
+
+    #[test]
+    fn test_cellvalue_display_string() {
+        let val = CellValue::String("Hello, World!".to_string());
+        assert_eq!(val.to_string(), "Hello, World!");
+    }
+
+    #[test]
+    fn test_cellvalue_display_empty() {
+        let val = CellValue::Empty;
+        assert_eq!(val.to_string(), "");
+    }
+
+    #[test]
+    fn test_cellvalue_display_error() {
+        let val = CellValue::Error("DIV/0!".to_string());
+        assert_eq!(val.to_string(), "ERROR: DIV/0!");
+    }
+
+    #[test]
+    fn test_cellvalue_to_raw_string_integer() {
+        let val = CellValue::Int(1234567);
+        assert_eq!(val.to_raw_string(), "1234567");
+    }
+
+    #[test]
+    fn test_cellvalue_to_raw_string_float() {
+        let val = CellValue::Float(123.45);
+        assert_eq!(val.to_raw_string(), "123.45");
+    }
+
+    #[test]
+    fn test_cellvalue_is_empty() {
+        assert!(CellValue::Empty.is_empty());
+        assert!(!CellValue::Int(0).is_empty());
+        assert!(!CellValue::String("".to_string()).is_empty());
+    }
+
+    #[test]
+    fn test_cellvalue_is_numeric() {
+        assert!(CellValue::Int(123).is_numeric());
+        assert!(CellValue::Float(123.45).is_numeric());
+        assert!(!CellValue::String("123".to_string()).is_numeric());
+        assert!(!CellValue::Empty.is_numeric());
+    }
+
+    #[test]
+    fn test_datetime_display() {
+        // Excel date: January 1, 1900 is day 1
+        let val = CellValue::DateTime(1.0);
+        let display = val.to_string();
+        // Should contain a date in YYYY-MM-DD format
+        assert!(display.contains("1900") || display.contains("1899"));
+    }
+
+    #[test]
+    fn test_datetime_with_time() {
+        // Excel datetime with time component
+        // Day 1 + 0.5 = 12:00:00 on Jan 1, 1900
+        let val = CellValue::DateTime(1.5);
+        let display = val.to_string();
+        // Should contain both date and time
+        assert!(display.contains(":"));
+        assert!(display.len() > 10); // Date + time is longer than just date
+    }
+
+    #[test]
+    fn test_workbook_open_real_file() {
+        // Test with actual test file if it exists
+        let result = Workbook::open("test_data.xlsx");
+        if result.is_ok() {
+            let mut wb = result.unwrap();
+            let sheet_names = wb.sheet_names();
+            assert!(!sheet_names.is_empty(), "Should have at least one sheet");
+        }
+        // If file doesn't exist, test passes (integration test needs real file)
+    }
+
+    #[test]
+    fn test_sheet_data_structure() {
+        // Test SheetData structure can be created
+        let sheet = SheetData {
+            headers: vec!["Name".to_string(), "Age".to_string()],
+            rows: vec![
+                vec![CellValue::String("Alice".to_string()), CellValue::Int(30)],
+                vec![CellValue::String("Bob".to_string()), CellValue::Int(25)],
+            ],
+            formulas: vec![vec![None, None], vec![None, None]],
+            width: 2,
+            height: 2,
+        };
+
+        assert_eq!(sheet.width, 2);
+        assert_eq!(sheet.height, 2);
+        assert_eq!(sheet.headers.len(), 2);
+        assert_eq!(sheet.rows.len(), 2);
     }
 }

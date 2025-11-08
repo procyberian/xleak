@@ -35,6 +35,7 @@ pub fn display_table(
     all_sheets: &[&str],
     max_width: usize,
     wrap: bool,
+    show_formulas: bool,
 ) -> Result<()> {
     // Print header info
     println!("\n╔═════════════════════════════════════════════════╗");
@@ -78,26 +79,42 @@ pub fn display_table(
         std::cmp::min(max_rows, data.rows.len())
     };
 
-    for row in data.rows.iter().take(rows_to_show) {
+    for (row_idx, row) in data.rows.iter().enumerate().take(rows_to_show) {
         let cells: Vec<Cell> = row
             .iter()
-            .map(|cell| {
-                let value = cell.to_string();
+            .enumerate()
+            .map(|(col_idx, cell)| {
+                // Get formula if it exists and show_formulas is true
+                let value = if show_formulas {
+                    data.formulas
+                        .get(row_idx)
+                        .and_then(|formula_row| formula_row.get(col_idx))
+                        .and_then(|f| f.as_ref())
+                        .map(|f| f.clone())
+                        .unwrap_or_else(|| cell.to_string())
+                } else {
+                    cell.to_string()
+                };
+
                 let formatted = format_cell_value(&value, max_width, wrap);
                 let cell_obj = Cell::new(&formatted);
 
-                // Style based on type
-                match cell {
-                    CellValue::Int(_) | CellValue::Float(_) => {
-                        cell_obj.style_spec("Fr") // Right-aligned numbers
+                // Style based on type (only when not showing formulas)
+                if show_formulas {
+                    cell_obj.style_spec("Fg") // Green for formulas
+                } else {
+                    match cell {
+                        CellValue::Int(_) | CellValue::Float(_) => {
+                            cell_obj.style_spec("Fr") // Right-aligned numbers
+                        }
+                        CellValue::Bool(_) => {
+                            cell_obj.style_spec("Fc") // Centered booleans
+                        }
+                        CellValue::Error(_) => {
+                            cell_obj.style_spec("Frc") // Red errors, centered
+                        }
+                        _ => cell_obj,
                     }
-                    CellValue::Bool(_) => {
-                        cell_obj.style_spec("Fc") // Centered booleans
-                    }
-                    CellValue::Error(_) => {
-                        cell_obj.style_spec("Frc") // Red errors, centered
-                    }
-                    _ => cell_obj,
                 }
             })
             .collect();

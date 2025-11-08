@@ -85,16 +85,15 @@ fn main() -> Result<()> {
         sheet_names[0].clone()
     };
 
-    // Load the sheet data
-    let data = wb
-        .load_sheet(&sheet_name)
-        .with_context(|| format!("Failed to load sheet '{sheet_name}'"))?;
-
     // Display, export, or run TUI
     if cli.interactive {
-        // Interactive TUI mode
-        tui::run_tui(data, &sheet_name)?;
+        // Interactive TUI mode - pass the workbook so it can switch sheets
+        tui::run_tui(wb, &sheet_name)?;
     } else {
+        // Load the sheet data for non-interactive modes
+        let data = wb
+            .load_sheet(&sheet_name)
+            .with_context(|| format!("Failed to load sheet '{sheet_name}'"))?;
         match cli.export.as_deref() {
             Some("csv") => {
                 display::export_csv(&data)?;
@@ -118,6 +117,7 @@ fn main() -> Result<()> {
                     &sheet_names_refs,
                     cli.max_width,
                     cli.wrap,
+                    cli.formulas,
                 )?;
             }
         }

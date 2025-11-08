@@ -2,6 +2,13 @@
 name = "xleak"
 version = "0.1.0"
 edition = "2024"
+authors = ["Your Name <your.email@example.com>"]
+description = "A fast terminal Excel viewer with interactive TUI, search, formulas, and export capabilities"
+license = "MIT"
+repository = "https://github.com/yourusername/xleak"
+keywords = ["excel", "xlsx", "terminal", "viewer", "tui"]
+categories = ["command-line-utilities", "visualization"]
+readme = "README.md"
 
 [dependencies]
 calamine = "0.26"
@@ -15,6 +22,9 @@ crossterm = "0.28"
 
 # Date/time handling
 chrono = "0.4"
+
+# Clipboard support
+arboard = "3.4"
 
 # Optional: for future export features
 # serde = { version = "1.0", features = ["derive"] }
