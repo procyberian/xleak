@@ -1545,6 +1545,21 @@ impl TuiState {
             Line::from("  Sheet dimensions (rows × columns) shown"),
             Line::from("  Match counter shown when searching (e.g., Match 3/12)"),
             Line::from(""),
+            Line::from(Span::styled(
+                "CONFIGURATION",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::from("  Customize keybindings and theme in config file:"),
+            Line::from("  ~/.config/xleak/config.toml"),
+            Line::from(""),
+            Line::from("  Supports VIM-style navigation (hjkl, gg, G, 0, $)"),
+            Line::from("  Custom keybindings per action"),
+            Line::from("  Default theme selection"),
+            Line::from(""),
+            Line::from("  See config.toml.example for all options"),
+            Line::from(""),
             Line::from(vec![Span::styled(
                 "Press any key to close",
                 Style::default()
