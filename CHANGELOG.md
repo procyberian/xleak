@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - VIM keybinding profile with hjkl navigation, gg/G jumps, and yank operations
 - Custom keybinding overrides for 23 different actions
 - `--config` flag to specify custom configuration file location
+- Added MIT License (thanks to @hardBSDk and @hwpplayer1! [#6](https://github.com/bgreenwell/xleak/issues/6))
 
 ### Changed
 - Help screen now includes configuration information
